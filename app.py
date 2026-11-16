@@ -126,7 +126,9 @@ def clean_data(df: pd.DataFrame, missing_strategy: str, duplicate_strategy: str)
 def numeric_series(df: pd.DataFrame, col: Optional[str]) -> pd.Series:
     if not col or col not in df.columns:
         return pd.Series(dtype="float64", index=df.index)
-    return pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    series = pd.to_numeric(df[col], errors="coerce")
+    return series.replace([np.inf, -np.inf], np.nan).fillna(0)
 
 
 def calculate_kpis(df: pd.DataFrame, sales_col: Optional[str], profit_col: Optional[str],
@@ -148,7 +150,7 @@ def calculate_kpis(df: pd.DataFrame, sales_col: Optional[str], profit_col: Optio
 
 
 def format_money(value: float, currency_symbol: str) -> str:
-    return f"{currency_symbol}{value:,.2f}"
+    return f"{currency_symbol}{value:,.0f}"
 
 
 # ----------------------------- Interface -----------------------------
@@ -292,11 +294,31 @@ if numeric_options:
 st.header("Key performance indicators")
 kpis = calculate_kpis(filtered, sales_col, profit_col, order_col, quantity_col)
 kpi_cols = st.columns(5)
-kpi_cols[0].metric("Total Sales", format_money(kpis["Total Sales"], currency_symbol) if kpis["Total Sales"] is not None else "N/A")
-kpi_cols[1].metric("Total Profit", format_money(kpis["Total Profit"], currency_symbol) if kpis["Total Profit"] is not None else "N/A")
-kpi_cols[2].metric("Total Orders", f"{kpis['Total Orders']:,}" if kpis["Total Orders"] is not None else "N/A")
-kpi_cols[3].metric("Total Quantity Sold", f"{kpis['Total Quantity Sold']:,.0f}" if kpis["Total Quantity Sold"] is not None else "N/A")
-kpi_cols[4].metric("Profit Margin", f"{kpis['Profit Margin (%)']:.2f}%" if kpis["Profit Margin (%)"] is not None else "N/A")
+
+kpi_cols[0].metric(
+    "Total Sales",
+    format_money(kpis["Total Sales"], currency_symbol) if kpis["Total Sales"] is not None else "N/A"
+)
+
+kpi_cols[1].metric(
+    "Total Profit",
+    format_money(kpis["Total Profit"], currency_symbol) if kpis["Total Profit"] is not None else "N/A"
+)
+
+kpi_cols[2].metric(
+    "Total Orders",
+    f"{kpis['Total Orders']:,}" if kpis["Total Orders"] is not None else "N/A"
+)
+
+kpi_cols[3].metric(
+    "Total Quantity Sold",
+    f"{kpis['Total Quantity Sold']:,.0f}" if kpis["Total Quantity Sold"] is not None else "N/A"
+)
+
+kpi_cols[4].metric(
+    "Profit Margin",
+    f"{kpis['Profit Margin (%)']:.2f}%" if kpis["Profit Margin (%)"] is not None else "N/A"
+)
 
 if not sales_col:
     st.warning("Map a Sales column to calculate meaningful sales KPIs and sales charts.")
