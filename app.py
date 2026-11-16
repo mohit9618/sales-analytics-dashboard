@@ -5,6 +5,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 
 st.set_page_config(
@@ -126,9 +127,21 @@ def clean_data(df: pd.DataFrame, missing_strategy: str, duplicate_strategy: str)
 def numeric_series(df: pd.DataFrame, col: Optional[str]) -> pd.Series:
     if not col or col not in df.columns:
         return pd.Series(dtype="float64", index=df.index)
-
     series = pd.to_numeric(df[col], errors="coerce")
     return series.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_exchange_rate(target_currency: str) -> tuple[float, str]:
+    """Get the latest reference rate for converting INR to the selected currency."""
+    if target_currency == "INR":
+        return 1.0, "INR base currency"
+
+    url = f"https://api.frankfurter.dev/v2/rate/inr/{target_currency.lower()}"
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    payload = response.json()
+    return float(payload["rate"]), str(payload.get("date", "Latest available rate"))
 
 
 def calculate_kpis(df: pd.DataFrame, sales_col: Optional[str], profit_col: Optional[str],
@@ -150,7 +163,7 @@ def calculate_kpis(df: pd.DataFrame, sales_col: Optional[str], profit_col: Optio
 
 
 def format_money(value: float, currency_symbol: str) -> str:
-    return f"{currency_symbol}{value:,.0f}"
+    return f"{currency_symbol}{value:,.2f}"
 
 
 # ----------------------------- Interface -----------------------------
@@ -168,7 +181,14 @@ with st.sidebar:
         "Missing-value handling",
         ["Keep missing values", "Fill numeric with median; text with mode", "Drop rows with missing values"],
     )
-    currency_symbol = st.selectbox("Currency display", ["₹", "$", "€", "£"], index=0)
+    currency_options = {
+        "INR (₹) - Indian Rupee": ("INR", "₹"),
+        "USD ($) - US Dollar": ("USD", "$"),
+        "EUR (€) - Euro": ("EUR", "€"),
+        "GBP (£) - British Pound": ("GBP", "£"),
+    }
+    selected_currency = st.selectbox("Display currency", list(currency_options.keys()))
+    target_currency, currency_symbol = currency_options[selected_currency]
 
 if uploaded is None:
     st.info("Upload a sales dataset to begin. The dashboard works best when the file contains fields such as Sales, Profit, Order ID, Quantity, Date, Region, and Category.")
@@ -291,34 +311,31 @@ if numeric_options:
                                        value=(low, high))
             filtered = filtered[filtered[selected_measure].between(*selected_range)]
 
+# Convert only the analysis copy. The original cleaned data remains in INR.
+try:
+    exchange_rate, exchange_rate_date = get_exchange_rate(target_currency)
+except (requests.RequestException, KeyError, ValueError) as exc:
+    st.error(f"Could not fetch the {target_currency} exchange rate. Please try again later. Details: {exc}")
+    st.stop()
+
+analysis_df = filtered.copy()
+for money_col in [sales_col, profit_col]:
+    if money_col and money_col in analysis_df.columns:
+        analysis_df[money_col] = numeric_series(analysis_df, money_col) * exchange_rate
+
+st.caption(
+    f"Currency conversion: 1 INR = {exchange_rate:.6g} {target_currency} "
+    f"(reference rate dated {exchange_rate_date})."
+)
+
 st.header("Key performance indicators")
-kpis = calculate_kpis(filtered, sales_col, profit_col, order_col, quantity_col)
+kpis = calculate_kpis(analysis_df, sales_col, profit_col, order_col, quantity_col)
 kpi_cols = st.columns(5)
-
-kpi_cols[0].metric(
-    "Total Sales",
-    format_money(kpis["Total Sales"], currency_symbol) if kpis["Total Sales"] is not None else "N/A"
-)
-
-kpi_cols[1].metric(
-    "Total Profit",
-    format_money(kpis["Total Profit"], currency_symbol) if kpis["Total Profit"] is not None else "N/A"
-)
-
-kpi_cols[2].metric(
-    "Total Orders",
-    f"{kpis['Total Orders']:,}" if kpis["Total Orders"] is not None else "N/A"
-)
-
-kpi_cols[3].metric(
-    "Total Quantity Sold",
-    f"{kpis['Total Quantity Sold']:,.0f}" if kpis["Total Quantity Sold"] is not None else "N/A"
-)
-
-kpi_cols[4].metric(
-    "Profit Margin",
-    f"{kpis['Profit Margin (%)']:.2f}%" if kpis["Profit Margin (%)"] is not None else "N/A"
-)
+kpi_cols[0].metric("Total Sales", format_money(kpis["Total Sales"], currency_symbol) if kpis["Total Sales"] is not None else "N/A")
+kpi_cols[1].metric("Total Profit", format_money(kpis["Total Profit"], currency_symbol) if kpis["Total Profit"] is not None else "N/A")
+kpi_cols[2].metric("Total Orders", f"{kpis['Total Orders']:,}" if kpis["Total Orders"] is not None else "N/A")
+kpi_cols[3].metric("Total Quantity Sold", f"{kpis['Total Quantity Sold']:,.0f}" if kpis["Total Quantity Sold"] is not None else "N/A")
+kpi_cols[4].metric("Profit Margin", f"{kpis['Profit Margin (%)']:.2f}%" if kpis["Profit Margin (%)"] is not None else "N/A")
 
 if not sales_col:
     st.warning("Map a Sales column to calculate meaningful sales KPIs and sales charts.")
@@ -339,24 +356,24 @@ else:
 
     with tab1:
         if date_col and pd.api.types.is_datetime64_any_dtype(filtered[date_col]):
-            trend = filtered.dropna(subset=[date_col]).groupby(date_col, as_index=False)[sales_col].sum()
+            trend = analysis_df.dropna(subset=[date_col]).groupby(date_col, as_index=False)[sales_col].sum()
             fig = px.line(trend, x=date_col, y=sales_col, markers=True,
-                          title="Sales over time", labels={sales_col: "Sales", date_col: "Date"})
+                          title="Sales over time", labels={sales_col: f"Sales ({currency_symbol})", date_col: "Date"})
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Map a valid date column to display the sales trend.")
         if category_col:
-            cat_sales = filtered.groupby(category_col, as_index=False)[sales_col].sum().sort_values(sales_col, ascending=False)
+            cat_sales = analysis_df.groupby(category_col, as_index=False)[sales_col].sum().sort_values(sales_col, ascending=False)
             fig = px.bar(cat_sales, x=category_col, y=sales_col, title="Sales by category",
-                         labels={sales_col: "Sales"})
+                         labels={sales_col: f"Sales ({currency_symbol})"})
             st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
         dimension = region_col or category_col
         if dimension:
-            grouped = filtered.groupby(dimension, as_index=False)[sales_col].sum().sort_values(sales_col, ascending=False)
+            grouped = analysis_df.groupby(dimension, as_index=False)[sales_col].sum().sort_values(sales_col, ascending=False)
             fig = px.pie(grouped, names=dimension, values=sales_col, hole=0.35,
-                         title=f"Sales share by {dimension}")
+                         title=f"Sales share by {dimension} ({currency_symbol})")
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Map a Region or Category column to show a sales breakdown.")
@@ -369,14 +386,14 @@ else:
     with tab3:
         if profit_col:
             if category_col:
-                prof = filtered.groupby(category_col, as_index=False)[profit_col].sum()
+                prof = analysis_df.groupby(category_col, as_index=False)[profit_col].sum()
                 fig = px.bar(prof, x=category_col, y=profit_col, title="Profit by category",
-                             labels={profit_col: "Profit"})
+                             labels={profit_col: f"Profit ({currency_symbol})"})
                 st.plotly_chart(fig, use_container_width=True)
             if sales_col:
-                scatter = filtered[[sales_col, profit_col]].copy()
+                scatter = analysis_df[[sales_col, profit_col]].copy()
                 fig = px.scatter(scatter, x=sales_col, y=profit_col,
-                                 title="Sales vs. Profit", opacity=0.65)
+                                 title=f"Sales vs. Profit ({currency_symbol})", opacity=0.65)
                 st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Map a Profit column to display profit analysis.")
@@ -386,4 +403,4 @@ st.subheader("Download cleaned and filtered data")
 csv_bytes = filtered.to_csv(index=False).encode("utf-8")
 st.download_button("Download filtered data as CSV", data=csv_bytes,
                    file_name="cleaned_filtered_sales.csv", mime="text/csv")
-st.caption("KPIs and charts update automatically when upload, column mappings, cleaning options, or filters change.")
+st.caption("KPIs and monetary charts update with the selected display currency. Downloads remain in the original INR values.")
